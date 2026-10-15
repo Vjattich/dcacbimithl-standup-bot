@@ -12,6 +12,9 @@ import com.sun.jna.win32.W32APIOptions;
 import java.awt.*;
 import java.awt.event.InputEvent;
 import java.awt.event.KeyEvent;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
  * Case&Bot stand-up minigame bot: finds the correct punchline button by reading the GameMaker runner's memory and clicks it.
@@ -103,7 +106,94 @@ public class Main {
         }
         return null;
     }
+
+    /**
+     * Same walk as {@link #instancesOf}, but collects every alive instance (several flowers can fly at once).
+     */
+    List<Inst> allInstancesOf(int objIndex) {
+        List<Inst> result = new java.util.ArrayList<>();
+        long obj = findObject(objIndex);
+        if (0 == obj) {
+            return result;
+        }
+        long link = toAddress(readInt(obj + OFF_OBJ_INSTANCES));
+        while (0 != link) {
+            long inst = toAddress(readInt(link + 8));
+            if (0 == inst) {
+                break;
+            }
+            if (0 == readByte(inst + OFF_MARKED) && 0 == readByte(inst + OFF_DEACTIVATED)) {
+                result.add(new Inst(inst, readInt(inst + OFF_ID), readFloat(inst + OFF_X), readFloat(inst + OFF_Y)));
+            }
+            link = toAddress(readInt(link));
+        }
+        return result;
+    }
+
     record Inst(long addr, int id, float x, float y) {
+    }
+
+    static final int OBJ_FLOWER = 340;          // objStandup_Flower (global.__objectNames[340])
+    static final double FLOWER_LAND_Y = 220.0;  // objStandup_ITEM.finalHeight: last path point y
+    static final double FLOWER_CLICK_Y = 220.0; // where we click; only mouse x matters for the bot
+    static final double RECLICK_DIST = 8.0;     // re-aim only if the prediction moved this far
+
+    record Sample(Inst inst, long tNanos) {
+    }
+
+    Map<Integer, Sample> prevFlowers = new HashMap<>();
+    double lastFlowerClickX = Double.NaN;
+
+    /**
+     * Flower catch.
+     * <p>
+     * "Move": left mouse release sets {@code posX = mouse x}, then the bot walks there at {@code standupBotSpeed} = 5 px/frame.
+     * The path is a straight line at constant speed, so two samples give velocity (vx, vy) and
+     * {@code eta = (y - 220) / -vy}, {@code landX = x + vx * eta}. We click landX of the flower with the smallest eta.
+     *
+     * @return true if at least one flower is alive
+     */
+    boolean catchFlowers(Robot robot) throws InterruptedException {
+        long now = System.nanoTime();
+        Map<Integer, Sample> current = new HashMap<>();
+        double bestEta = Double.MAX_VALUE;
+        double landX = Double.NaN;
+
+        for (Inst f : allInstancesOf(OBJ_FLOWER)) {
+            current.put(f.id(), new Sample(f, now));
+            Sample prev = prevFlowers.get(f.id());
+            if (null == prev) {
+                continue; // first time we see it, need a second sample for velocity
+            }
+            double dtMs = (now - prev.tNanos()) / 1e6;
+            double vx = (f.x() - prev.inst().x()) / dtMs;
+            double vy = (f.y() - prev.inst().y()) / dtMs;
+            //flying flowers go up (y decreases); after path end they fall or splat, skip those
+            if (vy >= 0 || f.y() <= FLOWER_LAND_Y) {
+                continue;
+            }
+            double eta = (f.y() - FLOWER_LAND_Y) / -vy;
+            if (eta < bestEta) {
+                bestEta = eta;
+                landX = f.x() + vx * eta;
+            }
+        }
+        prevFlowers = current;
+
+        if (Double.isNaN(landX)) {
+            lastFlowerClickX = Double.NaN;
+            return !current.isEmpty();
+        }
+        if (Double.isNaN(lastFlowerClickX) || Math.abs(landX - lastFlowerClickX) > RECLICK_DIST) {
+            POINT p = roomToScreen(landX, FLOWER_CLICK_Y);
+            System.out.printf("flower lands x=%.0f in %.0f ms -> click (%d,%d)%n", landX, bestEta, p.x, p.y);
+            robot.mouseMove(p.x, p.y);
+            robot.mousePress(InputEvent.BUTTON1_DOWN_MASK);
+            Thread.sleep(20);
+            robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
+            lastFlowerClickX = landX;
+        }
+        return true;
     }
 
 
@@ -184,6 +274,10 @@ public class Main {
                 Thread.sleep(40);
                 robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
                 lastClickedId = rightAnswerInst.id();
+                idleTicks = 0;
+            }
+            //Flowers in the air: click where the next one lands, the bot walks there by itself
+            else if (bot.catchFlowers(robot)) {
                 idleTicks = 0;
             }
             //Wait if there is no joke
